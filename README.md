@@ -7,6 +7,8 @@ extrudes lettering and custom shapes the way sign painters and lettering artists
 it by hand: duplicate the letterform, offset the copy, and connect the two with clean side faces —
 no 3D distortion, no warped letterforms. Made by [Club Lettreurs](https://www.clublettreurs.com).
 
+<p align="center"><img src="images/04.png" alt="Extruded ABC lettering with a cast shadow, built entirely from separate, selectable faces" width="640"></p>
+
 ---
 
 ## English
@@ -27,6 +29,13 @@ and a distance, and it duplicates your selected letterforms, offsets the copy, a
 connecting side faces as separate, selectable objects — each one its own path, so you can select,
 recolour or delete any single face afterwards. Unlike a true 3D extrude effect, the front face of
 the letter is never rotated or distorted: it stays exactly where you drew it.
+
+<p align="center">
+  <img src="images/plugin.png" alt="The plug-in's parameter dialog" width="200">
+  <img src="images/01.png" alt="The original selected letterforms" width="200">
+  <img src="images/02.png" alt="The letterforms extruded" width="200">
+  <img src="images/03.png" alt="The extruded letterforms with a cast shadow" width="200">
+</p>
 
 - **Angle** — the direction of the extrusion, as a compass bearing: 0°/360° North (up), 90° East
   (right), 180° South (down), 270° West (left), clockwise. Default **225°**.
@@ -104,6 +113,13 @@ séparés et sélectionnables — chacune est son propre chemin, qu'on peut sél
 supprimer ensuite individuellement. Contrairement à un véritable effet d'extrusion 3D, la face
 avant de la lettre n'est jamais tournée ni déformée : elle reste exactement là où elle a été
 dessinée.
+
+<p align="center">
+  <img src="images/plugin.png" alt="Le dialogue de paramètres du plugin" width="200">
+  <img src="images/01.png" alt="Les lettres sélectionnées, avant extrusion" width="200">
+  <img src="images/02.png" alt="Les lettres extrudées" width="200">
+  <img src="images/03.png" alt="Les lettres extrudées avec une ombre portée" width="200">
+</p>
 
 - **Angle** — la direction de l'extrusion, en cap de boussole : 0°/360° Nord (haut), 90° Est
   (droite), 180° Sud (bas), 270° Ouest (gauche), sens horaire. Par défaut **225°**.
