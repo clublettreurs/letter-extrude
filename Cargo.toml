@@ -1,7 +1,7 @@
 [package]
 name = "vectorcraft-plugin-letter-extrude"
 description = "VectorCraft WebAssembly object filter plug-in: Lettering Extrude (2D offset fake-perspective extrusion)"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 publish = false

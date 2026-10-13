@@ -10,11 +10,10 @@
 //! deletable after the filter runs — nothing is a "live" effect.
 //!
 //! The anchors of every back face and band are built as plain structs and serialized straight to
-//! JSON bytes (never through a `serde_json::Value` tree): with curves split into several bands
-//! each (see [`CURVE_STEPS`]), a single letter can need thousands of anchors, and building each one
-//! as a `Value` (a `String`-keyed map, allocated per field) costs enough interpreted instructions
-//! in the plug-in sandbox to exceed its budget. Only `serde` and `serde_json` are used: no imports,
-//! no WASI.
+//! JSON bytes (never through a `serde_json::Value` tree): building each one as a `Value` (a
+//! `String`-keyed map, allocated per field) costs enough interpreted instructions in the plug-in
+//! sandbox to exceed its budget at any real scale. Only `serde` and `serde_json` are used: no
+//! imports, no WASI.
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -157,22 +156,16 @@ fn run(doc: &Value, params: &Value) -> Vec<u8> {
     let side_amt = (params["sideShade"].as_f64().unwrap_or(35.0) / 100.0).clamp(0.0, 1.0);
     let offset = compass_offset(angle, distance);
     let shadow_on = params["shadow"].as_bool().unwrap_or(false);
-
-    // The curve subdivision (see `curve_steps`) that keeps the whole selection's total band count,
-    // and so the plug-in's instruction budget, bounded regardless of how many letters are selected.
-    // With the shadow on, the back face is extruded a second time: half the budget for each pass
-    // keeps the total about the same as the extrusion alone.
-    let steps = curve_steps(&objects, if shadow_on { 2 } else { 1 });
     let valid: Vec<&Value> = objects.iter().filter(|o| o.get("path").is_some()).collect();
 
-    // The cast shadow (one merged shape, the back face of every letter extruded again towards the
-    // shadow's own angle and distance) goes first: under the depth and the front faces, at the
-    // very back of the whole selection.
+    // The cast shadow (one merged shape, every letter's outer silhouette — never its counters —
+    // extruded again towards the shadow's own angle and distance) goes first: under the depth and
+    // the front faces, at the very back of the whole selection.
     let mut result = vec![];
     if shadow_on {
         let shadow_angle = params["shadowAngle"].as_f64().unwrap_or(115.0);
         let shadow_distance = params["shadowDistance"].as_f64().unwrap_or(50.0).clamp(1.0, 2000.0);
-        result.extend(shadow_object(&valid, offset, compass_offset(shadow_angle, shadow_distance), steps, side_amt));
+        result.extend(shadow_object(&valid, offset, compass_offset(shadow_angle, shadow_distance), side_amt));
     }
 
     // Every letter's depth (back face + side bands) is stacked below every letter's front face, in
@@ -180,7 +173,7 @@ fn run(doc: &Value, params: &Value) -> Vec<u8> {
     // right), one letter's depth must never cover a neighbour's front face.
     let (mut depth, mut fronts) = (vec![], vec![]);
     for obj in &valid {
-        let (back_and_bands, front) = extrude_one(obj, offset, side_amt, steps);
+        let (back_and_bands, front) = extrude_one(obj, offset, side_amt);
         depth.extend(back_and_bands);
         fronts.extend(front);
     }
@@ -192,32 +185,59 @@ fn run(doc: &Value, params: &Value) -> Vec<u8> {
     serde_json::to_vec(&Output { objects: result }).unwrap_or_else(|_| NO_SELECTION.to_vec())
 }
 
-/// The cast shadow: an extrusion of the main back face (kept exactly where it already is, not the
-/// original front letterform), towards its own `shadow_offset`, by the same principle as the main
-/// extrusion — a second back face and the bands connecting the two. Every letter's back face, its
-/// second back face and its bands are merged into one compound object (so the whole shadow is a
-/// single shape, not one per letter), filled with a flat grey as dark as `side_amt` (the side
-/// bands' own shading). `None` when nothing in `objects` has geometry to cast one.
-fn shadow_object(objects: &[&Value], main_offset: P, shadow_offset: P, steps: usize, side_amt: f64) -> Option<OutItem> {
-    let mut subpaths = vec![];
-    for sp in objects.iter().flat_map(|o| o["path"]["subpaths"].as_array().into_iter().flatten()) {
-        let back = shift_subpath(sp, main_offset);
-        // Depending on which edge they come from, bands can wind either way against their own
-        // contour (half its edges go "with" the offset, half "against"): fine for the main
-        // extrusion, where each band is its own object, but merged into one shape with one shared
-        // fillRule, an oppositely wound band cancels the contour's own fill out under it instead
-        // of adding to it — the shadow would then show no colour wherever that happens.
+/// The cast shadow: every letter's outer silhouette (never its counters — "contre-poinçons", the
+/// interior cutouts like the inside of an "O") kept exactly where the main back face already put
+/// it, extruded again towards `shadow_offset` by the same principle as the main extrusion — a
+/// second back face and the bands connecting the two, every one of them wound the same way as its
+/// own back face so a shared fillRule never cancels a piece out (this is as far as "Pathfinder
+/// Unite" goes here: the plug-in sandbox has no access to the host's own boolean engine, and
+/// working per edge like this never depends on the shape being convex, closed, or free of the
+/// sharp interior angles some fonts' outlines have). Every letter's pieces are merged into one
+/// compound object (so the whole shadow is a single shape, not one per letter), filled with a flat
+/// grey as dark as `side_amt` (the side bands' own shading). `None` when nothing in `objects` has
+/// geometry to cast one.
+fn shadow_object(objects: &[&Value], main_offset: P, shadow_offset: P, side_amt: f64) -> Option<OutItem> {
+    let mut subpaths: Vec<OutSubpath> = vec![];
+    for sp in objects.iter().flat_map(|o| outer_subpaths(o)) {
+        let back = shift_subpath(&sp, main_offset);
         let sign = signed_area(&back);
-        subpaths.extend(bands_for_out_subpath(&back, shadow_offset, steps).into_iter().map(|b| wound_like(b, sign)));
+        subpaths.extend(bands_for_out_subpath(&back, shadow_offset).into_iter().map(|b| wound_like(b, sign)));
         subpaths.push(shift_out_subpath(&back, shadow_offset));
         subpaths.push(back);
     }
     if subpaths.is_empty() {
         return None;
     }
+    // Letters (and a glyph's several outer pieces, e.g. "i"'s dot and stem) are independent shapes
+    // that should all read the same way under one shared fillRule: normalize every one of them to
+    // the first's winding.
+    let sign = signed_area(&subpaths[0]);
+    let subpaths: Vec<OutSubpath> = subpaths.into_iter().map(|sp| wound_like(sp, sign)).collect();
     // The same grey intensity as the side bands (sideShade), not the letters' own colour.
     let fill = json!({"type": "solid", "color": {"model": "gray", "k": side_amt}});
     Some(OutItem::New(NewObj { kind: "compound", path: OutPathData { subpaths }, fill_rule: "nonzero", fills: [fill] }))
+}
+
+/// `obj`'s subpaths that are letterform, not counters: every subpath whose winding sign matches
+/// the sign of the largest one by area (e.g. both the dot and the stem of "i", which share no
+/// counter, but never the hole of "O", wound the other way against its much larger outer ring).
+fn outer_subpaths(obj: &Value) -> Vec<Value> {
+    let Some(subpaths) = obj["path"]["subpaths"].as_array() else { return vec![] };
+    let areas: Vec<f64> = subpaths.iter().map(signed_area_json).collect();
+    let Some(dominant) = areas.iter().max_by(|a, b| a.abs().total_cmp(&b.abs())).map(|a| a.signum()) else { return vec![] };
+    subpaths.iter().zip(&areas).filter(|(_, a)| a.signum() == dominant).map(|(sp, _)| sp.clone()).collect()
+}
+
+/// The shoelace signed area of a subpath's anchor `"p"` points, read straight from input JSON.
+fn signed_area_json(sp: &Value) -> f64 {
+    let Some(anchors) = sp.get("anchors").and_then(Value::as_array) else { return 0.0 };
+    let n = anchors.len();
+    (0..n)
+        .map(|i| {
+            let (Some(a), Some(b)) = (point(&anchors[i], "p"), point(&anchors[(i + 1) % n], "p")) else { return 0.0 };
+            a.0 * b.1 - b.0 * a.1
+        })
+        .sum()
 }
 
 /// The shoelace signed area of `sp`'s anchor points (ignoring curvature, which doesn't change the
@@ -254,7 +274,7 @@ fn reverse_out_subpath(mut sp: OutSubpath) -> OutSubpath {
 
 /// The back duplicate and the side bands (sorted back to front), and the unchanged front object,
 /// for one input path or compound path.
-fn extrude_one(obj: &Value, offset: P, side_amt: f64, steps: usize) -> (Vec<OutItem>, Option<OutItem>) {
+fn extrude_one(obj: &Value, offset: P, side_amt: f64) -> (Vec<OutItem>, Option<OutItem>) {
     let Some(subpaths) = obj["path"]["subpaths"].as_array() else { return (vec![], None) };
     let rule: &'static str = if obj["fillRule"].as_str() == Some("evenodd") { "evenodd" } else { "nonzero" };
     let kind: &'static str = if obj["type"].as_str() == Some("compound") { "compound" } else { "path" };
@@ -267,7 +287,7 @@ fn extrude_one(obj: &Value, offset: P, side_amt: f64, steps: usize) -> (Vec<OutI
     let len = (offset.0 * offset.0 + offset.1 * offset.1).sqrt().max(1e-9);
     let dir = (offset.0 / len, offset.1 / len);
     let mut bands: Vec<(f64, OutSubpath)> =
-        subpaths.iter().flat_map(|sp| bands_for_subpath(sp, offset, steps)).map(|sp| (projection(&sp, dir), sp)).collect();
+        subpaths.iter().flat_map(|sp| bands_for_subpath(sp, offset)).map(|sp| (projection(&sp, dir), sp)).collect();
     // Furthest along the offset direction (most hidden) first, so later bands and the front face
     // layer correctly on top.
     bands.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -278,9 +298,9 @@ fn extrude_one(obj: &Value, offset: P, side_amt: f64, steps: usize) -> (Vec<OutI
     (result, obj.get("id").map(|id| OutItem::Kept { id: id.clone() }))
 }
 
-/// One quadrilateral (or `steps` curved bands, when the edge is a curve) per boundary edge of
-/// `sp`, filling the gap between it and its copy offset by `offset`.
-fn bands_for_subpath(sp: &Value, offset: P, steps: usize) -> Vec<OutSubpath> {
+/// One quadrilateral (or a few curved bands, when the edge is a curve) per boundary edge of `sp`,
+/// filling the gap between it and its copy offset by `offset`.
+fn bands_for_subpath(sp: &Value, offset: P) -> Vec<OutSubpath> {
     let anchors = sp.get("anchors").and_then(Value::as_array).cloned().unwrap_or_default();
     let closed = sp.get("closed").and_then(Value::as_bool).unwrap_or(false);
     let n = anchors.len();
@@ -292,7 +312,7 @@ fn bands_for_subpath(sp: &Value, offset: P, steps: usize) -> Vec<OutSubpath> {
         .filter_map(|i| {
             let a = anchors.get(i % n)?;
             let b = anchors.get((i + 1) % n)?;
-            Some(segment_bands(point(a, "p")?, point(a, "out"), point(b, "p")?, point(b, "in"), offset, steps))
+            Some(segment_bands(point(a, "p")?, point(a, "out"), point(b, "p")?, point(b, "in"), offset))
         })
         .flatten()
         .collect()
@@ -300,7 +320,7 @@ fn bands_for_subpath(sp: &Value, offset: P, steps: usize) -> Vec<OutSubpath> {
 
 /// The same as [`bands_for_subpath`], but reading a subpath already built as an [`OutSubpath`]
 /// (e.g. a back face) instead of input JSON: used to extrude the back face again for the shadow.
-fn bands_for_out_subpath(sp: &OutSubpath, offset: P, steps: usize) -> Vec<OutSubpath> {
+fn bands_for_out_subpath(sp: &OutSubpath, offset: P) -> Vec<OutSubpath> {
     let n = sp.anchors.len();
     if n < 2 {
         return vec![];
@@ -310,77 +330,62 @@ fn bands_for_out_subpath(sp: &OutSubpath, offset: P, steps: usize) -> Vec<OutSub
         .filter_map(|i| {
             let a = sp.anchors.get(i % n)?;
             let b = sp.anchors.get((i + 1) % n)?;
-            Some(segment_bands((a.p[0], a.p[1]), a.out.map(|h| (h[0], h[1])), (b.p[0], b.p[1]), b.h_in.map(|h| (h[0], h[1])), offset, steps))
+            Some(segment_bands((a.p[0], a.p[1]), a.out.map(|h| (h[0], h[1])), (b.p[0], b.p[1]), b.h_in.map(|h| (h[0], h[1])), offset))
         })
         .flatten()
         .collect()
 }
 
-/// The most bands one curved edge may be split into (the best case: one letter, a few curves),
-/// and the fewest (the worst case: a long selection), so a curve is still visibly better than the
-/// original single straight-sided band that started this.
-const MAX_CURVE_STEPS: usize = 12;
-const MIN_CURVE_STEPS: usize = 2;
-/// Roughly how many bands the whole selection should produce: the plug-in sandbox's instruction
-/// budget is one flat amount per run, not one per selected object, so a selection with many curved
-/// letters (a long word, a sentence) must subdivide each curve less to stay inside it. Chosen with
-/// a comfortable margin under the budget measured on a worst-case round, holed letterform.
-const TARGET_TOTAL_BANDS: usize = 320;
-
-/// The number of bands ([`MIN_CURVE_STEPS`]..=[`MAX_CURVE_STEPS`]) to split every curved edge into
-/// for this run, so the selection's total band count stays near [`TARGET_TOTAL_BANDS`] ÷ `passes`
-/// however many letters (and however many curves) are selected: more curves selected at once, or
-/// more extrusion passes (the shadow re-extrudes the back face, so `passes` is 2 with it on),
-/// fewer steps each.
-fn curve_steps(objects: &[Value], passes: usize) -> usize {
-    let (mut curved, mut straight) = (0usize, 0usize);
-    for sp in objects.iter().flat_map(|o| o["path"]["subpaths"].as_array().into_iter().flatten()) {
-        let (c, s) = segment_kinds(sp);
-        curved += c;
-        straight += s;
-    }
-    (TARGET_TOTAL_BANDS / passes.max(1))
-        .saturating_sub(straight)
-        .checked_div(curved)
-        .unwrap_or(MAX_CURVE_STEPS)
-        .clamp(MIN_CURVE_STEPS, MAX_CURVE_STEPS)
+/// The 2D cross product (scalar): positive when `b` is counter-clockwise from `a`.
+fn cross(a: P, b: P) -> f64 {
+    a.0 * b.1 - a.1 * b.0
 }
 
-/// How many of a subpath's edges are curves (at least one handle) versus straight, without
-/// building any bands yet: cheap enough to size [`curve_steps`] for the whole selection first.
-fn segment_kinds(sp: &Value) -> (usize, usize) {
-    let anchors = sp.get("anchors").and_then(Value::as_array).cloned().unwrap_or_default();
-    let closed = sp.get("closed").and_then(Value::as_bool).unwrap_or(false);
-    let n = anchors.len();
-    if n < 2 {
-        return (0, 0);
+/// The parameter values strictly inside `(0, 1)` where the cubic bezier `p0 p1 p2 p3`'s own
+/// tangent is exactly parallel to `offset`: the points where the swept band between the curve and
+/// its copy offset by `offset` must hand off from following the curve itself to following its
+/// offset copy (or back) to stay a simple, non-self-intersecting shape — found in closed form
+/// instead of approximated by sampling the curve at uniform steps. A cubic's derivative is a
+/// quadratic in `t` (`C'(t)/3 = qc + t·qb + t²·qa`), so `C'(t) × offset = 0` is a plain quadratic
+/// equation: at most 2 real roots, so a curved edge never needs more than 3 bands.
+fn tangent_crossings(p0: P, p1: P, p2: P, p3: P, offset: P) -> Vec<f64> {
+    let v0 = (p1.0 - p0.0, p1.1 - p0.1);
+    let v1 = (p2.0 - p1.0, p2.1 - p1.1);
+    let v2 = (p3.0 - p2.0, p3.1 - p2.1);
+    let qa = (v0.0 - 2.0 * v1.0 + v2.0, v0.1 - 2.0 * v1.1 + v2.1);
+    let qb = (2.0 * (v1.0 - v0.0), 2.0 * (v1.1 - v0.1));
+    let qc = v0;
+    let (a, b, c) = (cross(qa, offset), cross(qb, offset), cross(qc, offset));
+    const EPS: f64 = 1e-9;
+    let in_range = |t: f64| t > EPS && t < 1.0 - EPS;
+    if a.abs() < EPS {
+        return if b.abs() < EPS { vec![] } else { Some(-c / b).filter(|&t| in_range(t)).into_iter().collect() };
     }
-    let segments = if closed { n } else { n - 1 };
-    let (mut curved, mut straight) = (0, 0);
-    for i in 0..segments {
-        let (Some(a), Some(b)) = (anchors.get(i % n), anchors.get((i + 1) % n)) else { continue };
-        if point(a, "out").is_some() || point(b, "in").is_some() {
-            curved += 1
-        } else {
-            straight += 1
-        }
+    let disc = b * b - 4.0 * a * c;
+    if disc < 0.0 {
+        return vec![];
     }
-    (curved, straight)
+    let sq = disc.sqrt();
+    let mut ts: Vec<f64> = [(-b + sq) / (2.0 * a), (-b - sq) / (2.0 * a)].into_iter().filter(|&t| in_range(t)).collect();
+    ts.sort_by(f64::total_cmp);
+    ts
 }
 
 /// The band(s) between edge `a`(`a_out`) → `b`(`b_in`) and its copy offset by `offset`: one
-/// straight-sided band for a straight edge, or `steps` bands following the curve exactly (each a
-/// piece of the same cubic, so neighbouring bands share the true tangent) for a curved one.
-fn segment_bands(a: P, a_out: Option<P>, b: P, b_in: Option<P>, offset: P, steps: usize) -> Vec<OutSubpath> {
+/// straight-sided band for a straight edge. For a curved one, one band per piece between
+/// [`tangent_crossings`] (at most 2, so at most 3 bands) — the curve's true shape on both sides,
+/// not a polygon approximation of it, split only where the sweep's own direction actually changes.
+fn segment_bands(a: P, a_out: Option<P>, b: P, b_in: Option<P>, offset: P) -> Vec<OutSubpath> {
     if a_out.is_none() && b_in.is_none() {
         return vec![band(a, None, b, None, offset)];
     }
     let (p1, p2) = (a_out.unwrap_or(a), b_in.unwrap_or(b));
-    (0..steps)
-        .map(|i| {
-            let t0 = i as f64 / steps as f64;
-            let t1 = (i + 1) as f64 / steps as f64;
-            let [q0, q1, q2, q3] = sub_cubic(a, p1, p2, b, t0, t1);
+    let mut ts = vec![0.0];
+    ts.extend(tangent_crossings(a, p1, p2, b, offset));
+    ts.push(1.0);
+    ts.windows(2)
+        .map(|w| {
+            let [q0, q1, q2, q3] = sub_cubic(a, p1, p2, b, w[0], w[1]);
             band(q0, Some(q1), q3, Some(q2), offset)
         })
         .collect()
@@ -575,7 +580,7 @@ mod tests {
 
     #[test]
     fn a_band_connects_the_front_edge_to_its_offset_copy() {
-        let bands = bands_for_subpath(&json!({"closed": true, "anchors": [{"p": [0.0, 0.0]}, {"p": [10.0, 0.0]}]}), (5.0, -5.0), MAX_CURVE_STEPS);
+        let bands = bands_for_subpath(&json!({"closed": true, "anchors": [{"p": [0.0, 0.0]}, {"p": [10.0, 0.0]}]}), (5.0, -5.0));
         assert_eq!(bands.len(), 2, "a 2-anchor closed subpath has two edges (there and back)");
         let first = &bands[0].anchors;
         assert_eq!(first[0].p, [0.0, 0.0]);
@@ -585,37 +590,59 @@ mod tests {
     }
 
     #[test]
-    fn a_curved_edge_is_split_into_bands_that_follow_its_own_tangent() {
+    fn tangent_crossings_are_found_exactly_not_approximated() {
+        // A symmetric "S": tangent points straight up at t=0, straight down at t=1, so by symmetry
+        // it must be exactly horizontal at the midpoint — and nowhere else.
+        let (p0, p1, p2, p3) = ((0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0));
+        assert_eq!(tangent_crossings(p0, p1, p2, p3, (1.0, 0.0)), vec![0.5], "horizontal offset: crosses at the midpoint");
+        // A vertical offset's two roots land exactly on the endpoints (the curve starts and ends
+        // vertical): strictly outside (0, 1), so excluded, not rounded in.
+        assert_eq!(tangent_crossings(p0, p1, p2, p3, (0.0, 1.0)), Vec::<f64>::new(), "vertical offset: no interior crossing");
+    }
+
+    /// A curved edge whose tangent direction never matches the offset keeps the curve's own
+    /// handles exactly: one band for the whole edge, not a chain of small polygon-ish pieces.
+    #[test]
+    fn a_curved_edge_with_no_tangent_crossing_stays_a_single_band() {
         let sp = json!({"closed": false, "anchors": [
             {"p": [0.0, 0.0], "out": [10.0, 0.0]},
             {"p": [20.0, 0.0], "in": [15.0, 0.0]}]});
-        let steps = 7;
-        let bands = bands_for_subpath(&sp, (0.0, -30.0), steps);
-        // Connecting the two anchors directly (a single straight-sided band) cuts the curve's
-        // corner; following its tangent takes several smaller bands instead.
-        assert_eq!(bands.len(), steps);
-        assert_eq!(bands[0].anchors[0].p, [0.0, 0.0], "the first band starts where the curve does");
-        assert_eq!(bands[steps - 1].anchors[1].p, [20.0, 0.0], "the last band ends where the curve does");
-        // Consecutive bands are seamless: one's front end is the next's front start (allowing for
-        // last-bit floating point rounding between the two different De Casteljau subdivisions).
+        let bands = bands_for_subpath(&sp, (0.0, -30.0));
+        assert_eq!(bands.len(), 1, "{bands:?}");
+        assert_eq!(bands[0].anchors[0].p, [0.0, 0.0]);
+        assert_eq!(bands[0].anchors[0].out, Some([10.0, 0.0]), "the curve's own handle, kept exactly");
+        assert_eq!(bands[0].anchors[1].p, [20.0, 0.0]);
+        assert_eq!(bands[0].anchors[1].h_in, Some([15.0, 0.0]));
+    }
+
+    /// A curve whose tangent crosses the offset direction twice splits into exactly 3 bands, at
+    /// exactly those two points — not an arbitrary number of uniform slices.
+    #[test]
+    fn a_curve_that_turns_twice_relative_to_the_offset_splits_at_its_two_crossings() {
+        let (p0, p1, p2, p3) = ((0.0, 0.0), (0.75, 1.0), (-0.5, 2.0), (0.25, 3.0));
+        let offset = (0.0, 1.0);
+        let crossings = tangent_crossings(p0, p1, p2, p3, offset);
+        assert_eq!(crossings.len(), 2, "{crossings:?}");
+        assert!((crossings[0] - 0.25).abs() < 1e-9 && (crossings[1] - 0.75).abs() < 1e-9, "{crossings:?}");
+
+        let sp = json!({"closed": false, "anchors": [
+            {"p": [p0.0, p0.1], "out": [p1.0, p1.1]},
+            {"p": [p3.0, p3.1], "in": [p2.0, p2.1]}]});
+        let bands = bands_for_subpath(&sp, offset);
+        assert_eq!(bands.len(), 3, "{bands:?}");
+        assert_eq!(bands[0].anchors[0].p, [p0.0, p0.1], "the first band starts where the curve does");
+        assert_eq!(bands[2].anchors[1].p, [p3.0, p3.1], "the last band ends where the curve does");
+        // Seamless: one band's front end is the next's front start.
         for pair in bands.windows(2) {
             let (end, start) = (pair[0].anchors[1].p, pair[1].anchors[0].p);
             assert!((end[0] - start[0]).abs() < 1e-9 && (end[1] - start[1]).abs() < 1e-9, "{end:?} vs {start:?}");
-        }
-        // Every band's front curve ends exactly where the original cubic is at that parameter (De
-        // Casteljau subdivision reconstructs it, not an approximation).
-        for (i, band) in bands.iter().enumerate() {
-            let t = (i as f64 + 1.0) / steps as f64;
-            let [_, _, _, expected] = sub_cubic((0.0, 0.0), (10.0, 0.0), (15.0, 0.0), (20.0, 0.0), 0.0, t);
-            let got = band.anchors[1].p;
-            assert!((got[0] - expected.0).abs() < 1e-9 && (got[1] - expected.1).abs() < 1e-9, "band {i}: {got:?} vs {expected:?}");
         }
     }
 
     #[test]
     fn a_straight_edge_stays_a_single_band() {
         let sp = json!({"closed": false, "anchors": [{"p": [0.0, 0.0]}, {"p": [20.0, 0.0]}]});
-        assert_eq!(bands_for_subpath(&sp, (0.0, -30.0), MAX_CURVE_STEPS).len(), 1);
+        assert_eq!(bands_for_subpath(&sp, (0.0, -30.0)).len(), 1);
     }
 
     #[test]
@@ -668,11 +695,34 @@ mod tests {
         // position) back face itself, merged; two letters makes 12.
         assert_eq!(subpaths.len(), 12, "{shadow}");
         assert_eq!(shadow["fills"][0]["color"], json!({"model": "gray", "k": 0.6}), "as dark as sideShade (60%)");
-        // subpaths[4]: the back face's own back face (further South); subpaths[5]: the back face
-        // itself, kept exactly where the main extrusion already put it (East by the distance).
-        assert_eq!(subpaths[5]["anchors"][0]["p"], json!([15.0, 0.0]), "the back face, unmoved");
-        assert_eq!(subpaths[4]["anchors"][0]["p"], json!([15.0, 5.0]), "extruded again, straight South");
+        let bounds = |sp: &Value| {
+            let pts: Vec<(f64, f64)> = sp["anchors"].as_array().unwrap().iter().map(|a| point(a, "p").unwrap()).collect();
+            let (x0, x1) = pts.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)));
+            let (y0, y1) = pts.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.1), hi.max(p.1)));
+            (x0, y0, x1, y1)
+        };
+        // Every piece of the first letter's shadow fits inside the Minkowski-sum envelope of its
+        // back face (East by 15) extruded straight South by 5 more: 15..25 × 0..15.
+        for sp in &subpaths[..6] {
+            let (x0, y0, x1, y1) = bounds(sp);
+            assert!(x0 >= 15.0 - 1e-9 && x1 <= 25.0 + 1e-9 && y0 >= 0.0 - 1e-9 && y1 <= 15.0 + 1e-9, "{sp}");
+        }
         assert!(objects[0].get("id").is_none(), "a new object, not one of the kept letters");
+    }
+
+    /// A letter like "O" has a counter ("contre-poinçon": its hole, wound the other way against
+    /// the much larger outer ring). The shadow is a flat silhouette: it must only ever use the
+    /// outer contour, never the counter.
+    #[test]
+    fn the_shadow_ignores_counters() {
+        let outer = json!({"closed": true, "anchors": [{"p": [0.0, 0.0]}, {"p": [20.0, 0.0]}, {"p": [20.0, 20.0]}, {"p": [0.0, 20.0]}]});
+        let hole = json!({"closed": true, "anchors": [{"p": [5.0, 5.0]}, {"p": [5.0, 15.0]}, {"p": [15.0, 15.0]}, {"p": [15.0, 5.0]}]});
+        let obj = json!({"id": 1, "type": "path", "fillRule": "nonzero",
+            "path": {"subpaths": [outer, hole]}});
+        let out = run_json(&json!({"objects": [obj]}), &json!({"angle": 90, "distance": 10, "shadow": true, "shadowAngle": 90, "shadowDistance": 5}));
+        let subpaths = out["objects"][0]["path"]["subpaths"].as_array().unwrap();
+        // The outer square alone: 4 bands + its own back face + the (kept position) back face.
+        assert_eq!(subpaths.len(), 6, "only the outer contour casts a shadow, never the hole: {subpaths:?}");
     }
 
     /// Every subpath the shadow merges winds the same way. A band wound the other way from the
@@ -702,6 +752,48 @@ mod tests {
         };
         let signs: Vec<f64> = shadow_subpaths.iter().map(|sp| area_of(sp).signum()).collect();
         assert!(signs.iter().all(|&s| s == signs[0]), "{signs:?}");
+    }
+
+    /// An "L": a concave (reflex) corner where the vertical and horizontal strokes meet. Unlike a
+    /// scheme that tries to find one clean swept boundary analytically, building a band per edge
+    /// and separately fixing up each one's own winding never depends on the shape being convex —
+    /// it must stay transparency-free (every piece wound the same way) here too.
+    #[test]
+    fn a_concave_letterform_still_winds_consistently() {
+        let l = json!({"id": 1, "type": "path", "fillRule": "nonzero",
+            "path": {"subpaths": [{"closed": true, "anchors": [
+                {"p": [0.0, 0.0]}, {"p": [10.0, 0.0]}, {"p": [10.0, 30.0]}, {"p": [40.0, 30.0]},
+                {"p": [40.0, 40.0]}, {"p": [0.0, 40.0]}]}]}});
+        let out = run_json(&json!({"objects": [l]}), &json!({"angle": 45, "distance": 15, "shadow": true, "shadowAngle": 225, "shadowDistance": 12}));
+        let subpaths = out["objects"][0]["path"]["subpaths"].as_array().unwrap();
+        let area_of = |sp: &Value| -> f64 {
+            let anchors = sp["anchors"].as_array().unwrap();
+            let n = anchors.len();
+            (0..n)
+                .map(|i| {
+                    let (a, b) = (point(&anchors[i], "p").unwrap(), point(&anchors[(i + 1) % n], "p").unwrap());
+                    a.0 * b.1 - b.0 * a.1
+                })
+                .sum()
+        };
+        let signs: Vec<f64> = subpaths.iter().map(area_of).map(f64::signum).collect();
+        assert!(signs.iter().all(|&s| s == signs[0]), "{signs:?}");
+    }
+
+    /// An open (unclosed) subpath — some fonts' outlines import this way. The shadow must still
+    /// extrude it (as many bands as it has segments, none wrapping around to close it), not
+    /// silently skip it.
+    #[test]
+    fn an_open_subpath_still_casts_a_shadow() {
+        let open = json!({"id": 1, "type": "path", "fillRule": "nonzero",
+            "path": {"subpaths": [{"closed": false, "anchors": [
+                {"p": [0.0, 0.0]}, {"p": [10.0, 0.0]}, {"p": [10.0, 10.0]}]}]}});
+        let out =
+            run_json(&json!({"objects": [open]}), &json!({"angle": 90, "distance": 10, "shadow": true, "shadowAngle": 180, "shadowDistance": 5}));
+        let subpaths = out["objects"][0]["path"]["subpaths"].as_array().unwrap();
+        // 2 segments (open, so no closing edge) = 2 bands, plus its own back face and the back
+        // face itself.
+        assert_eq!(subpaths.len(), 4, "{subpaths:?}");
     }
 
     #[test]
@@ -763,15 +855,18 @@ mod tests {
         let bytes = run(&json!({"objects": [letter_o(100.0, 100.0)]}), &json!({"angle": 45, "distance": 40, "sideShade": 35}));
         let out: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(out.get("error").is_none(), "{out}");
-        // One letter's curves get the full MAX_CURVE_STEPS: 2 subpaths * 4 curved edges * steps
-        // bands, plus the back face and the front kept.
-        assert_eq!(out["objects"].as_array().unwrap().len(), 2 * 4 * MAX_CURVE_STEPS + 2);
+        // A circle's tangent is parallel to any given direction at exactly 2 of its points
+        // (diametrically opposite), landing in 2 of its 4 quarter-arc edges (1 extra band each);
+        // the other 2 edges keep their single band: 6 bands per circle, 12 for the 2 (outer +
+        // hole) subpaths of "O", plus its one merged back face and the kept front.
+        assert_eq!(out["objects"].as_array().unwrap().len(), 12 + 2, "{out}");
     }
 
     /// A full sentence's worth of round, holed letters (the worst realistic case: 8 curved edges
-    /// each) used to exceed the budget even after the struct-based rewrite above — at a flat
-    /// `MAX_CURVE_STEPS`, the total band count grows with the selection, not just with one
-    /// letter's own curves. `curve_steps` must scale it down so a long selection still succeeds.
+    /// each) used to exceed the budget before the struct-based rewrite. Each curved edge now splits
+    /// only where its own tangent actually crosses the offset direction (at most 2 points, so at
+    /// most 3 bands), a bound that holds per edge regardless of how many letters are selected: no
+    /// adaptive scaling is needed any more to keep a long selection inside the budget.
     #[test]
     fn a_long_selection_of_curvy_letters_still_fits_the_instruction_budget() {
         let objects: Vec<Value> = (0..40)
@@ -784,12 +879,13 @@ mod tests {
         let bytes = run(&json!({"objects": objects}), &json!({"angle": 45, "distance": 40, "sideShade": 35}));
         let out: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(out.get("error").is_none(), "{out}");
-        assert_eq!(out["objects"].as_array().unwrap().len(), 40 * (2 * 4 * MIN_CURVE_STEPS + 2));
+        // Each of the 40 letters produces the same fixed count as a single one above: the total
+        // grows linearly with the selection, never risking the budget however long it gets.
+        assert_eq!(out["objects"].as_array().unwrap().len(), 40 * 14, "{out}");
     }
 
-    /// The shadow re-extrudes every back face, roughly doubling the work for the same selection:
-    /// `curve_steps` must halve its budget per pass when it is on, or a long selection that was
-    /// fine without it could exceed the instruction budget with it.
+    /// The shadow re-extrudes every back face, roughly doubling the work for the same selection —
+    /// still unconditionally safe, since each curved edge's band count is bounded on its own.
     #[test]
     fn a_long_selection_still_fits_the_budget_with_the_shadow_on_too() {
         let objects: Vec<Value> = (0..40)

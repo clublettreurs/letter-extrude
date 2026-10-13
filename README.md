@@ -52,6 +52,12 @@ Curved letterforms are followed exactly (not approximated with straight segments
 letters can be extruded together in one run: later letters never cover an earlier letter's face,
 however the angle is set.
 
+**Known limitation:** a curved side band is split only where it mathematically has to be (where
+the curve's own tangent lines up with the extrusion direction), which keeps clean curves clean and
+lightweight. A handful of fonts draw their curves with unusual or poorly-placed anchors/handles
+(not a true smooth curve), which can occasionally still show a small artefact on a side band in
+those spots — this comes from the font's own outline, not from the selection or the parameters.
+
 ### Download
 
 Grab the latest compiled plug-in here — no build tools needed:
@@ -137,6 +143,13 @@ dessinée.
 Les lettres courbes sont suivies exactement (pas approximées par des segments droits), et plusieurs
 lettres peuvent être extrudées en une seule fois : une lettre suivante ne recouvre jamais la face
 d'une lettre précédente, quel que soit l'angle choisi.
+
+**Limite connue :** une bande latérale courbe n'est découpée que là où c'est mathématiquement
+nécessaire (là où la tangente de la courbe s'aligne avec la direction d'extrusion), ce qui garde les
+courbes propres et légères. Certaines fontes dessinent leurs courbes avec des poignées mal placées
+ou inhabituelles (pas une vraie courbe lisse), ce qui peut occasionnellement encore laisser un petit
+défaut visuel sur une bande à cet endroit — cela vient du tracé d'origine de la fonte, pas de la
+sélection ni des paramètres.
 
 ### Télécharger
 
