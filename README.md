@@ -5,7 +5,7 @@
 A free, open-source plug-in for [VectorCraft](https://getartcraft.com/apps/vectorcraft) that
 extrudes lettering and custom shapes the way sign painters and lettering artists have always done
 it by hand: duplicate the letterform, offset the copy, and connect the two with clean side faces —
-no 3D distortion, no warped letterforms. Made by [Club Lettreurs](https://github.com/clublettreurs).
+no 3D distortion, no warped letterforms. Made by [Club Lettreurs](https://www.clublettreurs.com).
 
 ---
 
