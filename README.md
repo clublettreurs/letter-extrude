@@ -43,7 +43,10 @@ the letter is never rotated or distorted: it stays exactly where you drew it.
 - **Side Shade** — how much the side faces are darkened towards black, 0–100%. Default **35%**.
 - **Shadow** — an optional cast shadow: the back face is extruded a second time, towards its own
   angle and distance, and everything (every letter's back face, its own extrusion and the
-  connecting bands) is merged into one single shape placed behind everything else. Off by default.
+  connecting bands) is merged into one single shape placed behind everything else. Several
+  overlapping letters merge seamlessly into one silhouette, and each letter's own counter (the
+  hole of an "O", "A", "B", "P"...) stays a real, transparent hole in the shadow too. Off by
+  default.
   - **Shadow Angle** — compass bearing of the cast shadow. Default **115°**.
   - **Shadow Distance** — how far the cast shadow reaches, in points. Default **50**.
   - The shadow's grey matches the Side Shade intensity.
@@ -135,7 +138,9 @@ dessinée.
 - **Shadow** (ombre portée) — une ombre portée facultative : la face arrière est elle-même extrudée
   une seconde fois, selon son propre angle et sa propre distance, et le tout (face arrière, sa
   propre extrusion et les bandes de liaison, pour chaque lettre) est fusionné en une seule forme
-  placée tout en arrière-plan. Désactivée par défaut.
+  placée tout en arrière-plan. Plusieurs lettres qui se chevauchent fusionnent sans couture en une
+  seule silhouette, et la contre-forme de chaque lettre (l'œil d'un « O », « A », « B », « P »...)
+  reste un vrai trou transparent dans l'ombre aussi. Désactivée par défaut.
   - **Shadow Angle** — cap de boussole de l'ombre portée. Par défaut **115°**.
   - **Shadow Distance** — profondeur de l'ombre portée, en points. Par défaut **50**.
   - Le gris de l'ombre reprend l'intensité de Side Shade.

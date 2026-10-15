@@ -185,47 +185,57 @@ fn run(doc: &Value, params: &Value) -> Vec<u8> {
     serde_json::to_vec(&Output { objects: result }).unwrap_or_else(|_| NO_SELECTION.to_vec())
 }
 
-/// The cast shadow: every letter's outer silhouette (never its counters — "contre-poinçons", the
-/// interior cutouts like the inside of an "O") kept exactly where the main back face already put
-/// it, extruded again towards `shadow_offset` by the same principle as the main extrusion — a
-/// second back face and the bands connecting the two, every one of them wound the same way as its
-/// own back face so a shared fillRule never cancels a piece out (this is as far as "Pathfinder
-/// Unite" goes here: the plug-in sandbox has no access to the host's own boolean engine, and
-/// working per edge like this never depends on the shape being convex, closed, or free of the
-/// sharp interior angles some fonts' outlines have). Every letter's pieces are merged into one
-/// compound object (so the whole shadow is a single shape, not one per letter), filled with a flat
-/// grey as dark as `side_amt` (the side bands' own shading). `None` when nothing in `objects` has
-/// geometry to cast one.
+/// The cast shadow: every letter's own back face (outer contour AND counters alike — "contre-
+/// formes", the hole of an "O", "A", "B" or "P" — nothing is excluded) kept exactly where the main
+/// back face already put it, extruded again towards `shadow_offset` by the same principle as the
+/// main extrusion — a second back face and the bands connecting the two, every one of them wound
+/// the same way as its own back face so a shared fillRule never cancels a piece out against
+/// ITSELF (this is as far as "Pathfinder Unite" goes here: the plug-in sandbox has no access to
+/// the host's own boolean engine, and working per edge like this never depends on the shape being
+/// convex, closed, or free of the sharp interior angles some fonts' outlines have). Every piece,
+/// from every letter, is merged into ONE compound object: normalizing every letterform piece to
+/// one reference winding, and every COUNTER piece to the OPPOSITE one, makes several overlapping
+/// letters' outer silhouettes read as one seamless union (no seam at their shared boundary) while
+/// each counter keeps subtracting — staying transparent — exactly like the original glyph's own
+/// fillRule already does. Filled with a flat grey as dark as `side_amt` (the side bands' own
+/// shading). `None` when nothing in `objects` has geometry to cast one.
+///
+/// Known limitation (inherent to merging everything under one shared fillRule with no access to a
+/// real boolean engine): if one letter's counter happens to spatially overlap a DIFFERENT letter's
+/// own solid material (very tightly overlapping letters), that overlap can read as transparent
+/// instead of solid. Ordinary side-by-side or touching lettering, where a counter sits well inside
+/// its own letter, is unaffected.
 fn shadow_object(objects: &[&Value], main_offset: P, shadow_offset: P, side_amt: f64) -> Option<OutItem> {
-    let mut subpaths: Vec<OutSubpath> = vec![];
-    for sp in objects.iter().flat_map(|o| outer_subpaths(o)) {
+    let mut subpaths: Vec<(OutSubpath, bool)> = vec![];
+    for (sp, is_outer) in objects.iter().flat_map(|o| subpaths_with_role(o)) {
         let back = shift_subpath(&sp, main_offset);
         let sign = signed_area(&back);
-        subpaths.extend(bands_for_out_subpath(&back, shadow_offset).into_iter().map(|b| wound_like(b, sign)));
-        subpaths.push(shift_out_subpath(&back, shadow_offset));
-        subpaths.push(back);
+        subpaths.extend(bands_for_out_subpath(&back, shadow_offset).into_iter().map(|b| (wound_like(b, sign), is_outer)));
+        subpaths.push((shift_out_subpath(&back, shadow_offset), is_outer));
+        subpaths.push((back, is_outer));
     }
     if subpaths.is_empty() {
         return None;
     }
-    // Letters (and a glyph's several outer pieces, e.g. "i"'s dot and stem) are independent shapes
-    // that should all read the same way under one shared fillRule: normalize every one of them to
-    // the first's winding.
-    let sign = signed_area(&subpaths[0]);
-    let subpaths: Vec<OutSubpath> = subpaths.into_iter().map(|sp| wound_like(sp, sign)).collect();
+    // Every letterform piece (across every letter) shares one winding, so they simply union
+    // together; every counter piece shares the OPPOSITE one, so it keeps subtracting from whatever
+    // letterform material it overlaps (its own letter's, almost always).
+    let reference = subpaths.iter().find(|(_, is_outer)| *is_outer).map(|(sp, _)| signed_area(sp)).unwrap_or(1.0);
+    let subpaths: Vec<OutSubpath> =
+        subpaths.into_iter().map(|(sp, is_outer)| wound_like(sp, if is_outer { reference } else { -reference })).collect();
     // The same grey intensity as the side bands (sideShade), not the letters' own colour.
     let fill = json!({"type": "solid", "color": {"model": "gray", "k": side_amt}});
     Some(OutItem::New(NewObj { kind: "compound", path: OutPathData { subpaths }, fill_rule: "nonzero", fills: [fill] }))
 }
 
-/// `obj`'s subpaths that are letterform, not counters: every subpath whose winding sign matches
-/// the sign of the largest one by area (e.g. both the dot and the stem of "i", which share no
-/// counter, but never the hole of "O", wound the other way against its much larger outer ring).
-fn outer_subpaths(obj: &Value) -> Vec<Value> {
+/// `obj`'s subpaths, each tagged with whether it's letterform (`true`, same winding sign as the
+/// largest one by area — e.g. both the dot and the stem of "i", which share no counter) or one of
+/// its counters (`false`, wound the other way — e.g. the hole of "O", "A", "B" or "P").
+fn subpaths_with_role(obj: &Value) -> Vec<(Value, bool)> {
     let Some(subpaths) = obj["path"]["subpaths"].as_array() else { return vec![] };
     let areas: Vec<f64> = subpaths.iter().map(signed_area_json).collect();
     let Some(dominant) = areas.iter().max_by(|a, b| a.abs().total_cmp(&b.abs())).map(|a| a.signum()) else { return vec![] };
-    subpaths.iter().zip(&areas).filter(|(_, a)| a.signum() == dominant).map(|(sp, _)| sp.clone()).collect()
+    subpaths.iter().zip(&areas).map(|(sp, a)| (sp.clone(), a.signum() == dominant)).collect()
 }
 
 /// The shoelace signed area of a subpath's anchor `"p"` points, read straight from input JSON.
@@ -710,19 +720,106 @@ mod tests {
         assert!(objects[0].get("id").is_none(), "a new object, not one of the kept letters");
     }
 
-    /// A letter like "O" has a counter ("contre-poinçon": its hole, wound the other way against
-    /// the much larger outer ring). The shadow is a flat silhouette: it must only ever use the
-    /// outer contour, never the counter.
+    /// A letter like "O", "A", "B" or "P" has a counter ("contre-forme": its hole, wound the
+    /// other way against the much larger outer ring). The shadow must include it too, as a real
+    /// hole cut into the single merged shape, not fill over it.
     #[test]
-    fn the_shadow_ignores_counters() {
+    fn the_shadow_includes_counters_as_real_holes() {
         let outer = json!({"closed": true, "anchors": [{"p": [0.0, 0.0]}, {"p": [20.0, 0.0]}, {"p": [20.0, 20.0]}, {"p": [0.0, 20.0]}]});
         let hole = json!({"closed": true, "anchors": [{"p": [5.0, 5.0]}, {"p": [5.0, 15.0]}, {"p": [15.0, 15.0]}, {"p": [15.0, 5.0]}]});
         let obj = json!({"id": 1, "type": "path", "fillRule": "nonzero",
             "path": {"subpaths": [outer, hole]}});
-        let out = run_json(&json!({"objects": [obj]}), &json!({"angle": 90, "distance": 10, "shadow": true, "shadowAngle": 90, "shadowDistance": 5}));
+        // A shadow angle not aligned with any of the square's own axis-aligned edges: otherwise an
+        // edge exactly parallel to the offset sweeps into a zero-area (degenerate) band, whose
+        // meaningless signed area would otherwise skew the sign count checked below.
+        let out =
+            run_json(&json!({"objects": [obj]}), &json!({"angle": 90, "distance": 10, "shadow": true, "shadowAngle": 135, "shadowDistance": 5}));
         let subpaths = out["objects"][0]["path"]["subpaths"].as_array().unwrap();
-        // The outer square alone: 4 bands + its own back face + the (kept position) back face.
-        assert_eq!(subpaths.len(), 6, "only the outer contour casts a shadow, never the hole: {subpaths:?}");
+        // Outer: 4 bands + its own back face + the (kept position) back face = 6; same for the
+        // counter, extruded into the shadow exactly like the outer: 12 total, not 6.
+        assert_eq!(subpaths.len(), 12, "the counter must still cast its own shadow pieces: {subpaths:?}");
+        let area_of = |sp: &Value| -> f64 {
+            let anchors = sp["anchors"].as_array().unwrap();
+            let n = anchors.len();
+            (0..n)
+                .map(|i| {
+                    let (a, b) = (point(&anchors[i], "p").unwrap(), point(&anchors[(i + 1) % n], "p").unwrap());
+                    a.0 * b.1 - b.0 * a.1
+                })
+                .sum()
+        };
+        let signs: Vec<f64> = subpaths.iter().map(|sp| area_of(sp).signum()).collect();
+        let (positive, negative): (Vec<f64>, Vec<f64>) = signs.iter().copied().partition(|&s| s > 0.0);
+        assert_eq!(
+            (positive.len(), negative.len()),
+            (6, 6),
+            "the outer's 6 pieces and the counter's 6 must wind oppositely so the counter stays a hole: {signs:?}"
+        );
+    }
+
+    /// Two overlapping letters (no counters here): their outer silhouettes must union seamlessly
+    /// into the merged shadow — every one of their pieces shares the same winding, so nonzero
+    /// never cancels anything at the shared, overlapping boundary.
+    #[test]
+    fn the_shadow_merges_overlapping_letters_without_seams() {
+        let letter = |id: u64, x: f64| {
+            json!({"id": id, "type": "path", "fillRule": "nonzero",
+                "path": {"subpaths": [{"closed": true, "anchors": [
+                    {"p": [x, 0.0]}, {"p": [x + 20.0, 0.0]}, {"p": [x + 20.0, 20.0]}, {"p": [x, 20.0]}]}]}})
+        };
+        // The second letter starts well inside the first one: their footprints overlap.
+        let out = run_json(
+            &json!({"objects": [letter(1, 0.0), letter(2, 10.0)]}),
+            &json!({"angle": 90, "distance": 10, "shadow": true, "shadowAngle": 135, "shadowDistance": 5}),
+        );
+        let subpaths = out["objects"][0]["path"]["subpaths"].as_array().unwrap();
+        assert_eq!(subpaths.len(), 12, "6 pieces per overlapping letter, none dropped: {subpaths:?}");
+        let area_of = |sp: &Value| -> f64 {
+            let anchors = sp["anchors"].as_array().unwrap();
+            let n = anchors.len();
+            (0..n)
+                .map(|i| {
+                    let (a, b) = (point(&anchors[i], "p").unwrap(), point(&anchors[(i + 1) % n], "p").unwrap());
+                    a.0 * b.1 - b.0 * a.1
+                })
+                .sum()
+        };
+        let signs: Vec<f64> = subpaths.iter().map(|sp| area_of(sp).signum()).collect();
+        assert!(signs.iter().all(|&s| s == signs[0]), "every piece must share one winding so the overlap reads as one seamless union: {signs:?}");
+    }
+
+    /// Several letters selected together, each with its own counter: every letterform piece
+    /// (across every letter) shares one winding, and every counter piece shares the opposite one —
+    /// nothing is lost or filtered, and each letter's own counter stays its own transparent hole.
+    #[test]
+    fn the_shadow_keeps_each_letters_own_counter_transparent_with_several_letters_selected() {
+        let letter_with_counter = |id: u64, x: f64| {
+            let outer = json!({"closed": true, "anchors": [
+                {"p": [x, 0.0]}, {"p": [x + 20.0, 0.0]}, {"p": [x + 20.0, 20.0]}, {"p": [x, 20.0]}]});
+            let hole = json!({"closed": true, "anchors": [
+                {"p": [x + 5.0, 5.0]}, {"p": [x + 5.0, 15.0]}, {"p": [x + 15.0, 15.0]}, {"p": [x + 15.0, 5.0]}]});
+            json!({"id": id, "type": "compound", "fillRule": "nonzero", "path": {"subpaths": [outer, hole]}})
+        };
+        // Far enough apart that only their shadows (never their own footprints) could ever touch.
+        let out = run_json(
+            &json!({"objects": [letter_with_counter(1, 0.0), letter_with_counter(2, 40.0)]}),
+            &json!({"angle": 90, "distance": 10, "shadow": true, "shadowAngle": 135, "shadowDistance": 5}),
+        );
+        let subpaths = out["objects"][0]["path"]["subpaths"].as_array().unwrap();
+        assert_eq!(subpaths.len(), 24, "12 pieces per letter-with-counter, both letters kept: {subpaths:?}");
+        let area_of = |sp: &Value| -> f64 {
+            let anchors = sp["anchors"].as_array().unwrap();
+            let n = anchors.len();
+            (0..n)
+                .map(|i| {
+                    let (a, b) = (point(&anchors[i], "p").unwrap(), point(&anchors[(i + 1) % n], "p").unwrap());
+                    a.0 * b.1 - b.0 * a.1
+                })
+                .sum()
+        };
+        let signs: Vec<f64> = subpaths.iter().map(|sp| area_of(sp).signum()).collect();
+        let (positive, negative): (Vec<f64>, Vec<f64>) = signs.iter().copied().partition(|&s| s > 0.0);
+        assert_eq!((positive.len(), negative.len()), (12, 12), "both letters' outers agree, both counters agree, and oppose: {signs:?}");
     }
 
     /// Every subpath the shadow merges winds the same way. A band wound the other way from the
