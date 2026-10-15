@@ -200,6 +200,15 @@ fn run(doc: &Value, params: &Value) -> Vec<u8> {
 /// fillRule already does. Filled with a flat grey as dark as `side_amt` (the side bands' own
 /// shading). `None` when nothing in `objects` has geometry to cast one.
 ///
+/// A counter's own connecting bands (the wall of its own little tube, from its hole boundary here
+/// to its shadow-shifted copy) are always solid material, never part of the hole — exactly how the
+/// main extrusion already treats a hole's own side bands (the inside wall of an "O" is shaded,
+/// same as its outer wall; only the FRONT and BACK faces actually show through the hole). Only the
+/// two flat cross-sections — the counter's shape kept here, and its shadow-shifted copy further
+/// out — stay the counter's own transparent hole. Tagging a counter's bands as holes too (instead
+/// of solid, like the lettering) used to show a visible transparent "tunnel" connecting a letter's
+/// two counter positions, looking like a hollow cylinder cut clean through the grey shadow.
+///
 /// Known limitation (inherent to merging everything under one shared fillRule with no access to a
 /// real boolean engine): if one letter's counter happens to spatially overlap a DIFFERENT letter's
 /// own solid material (very tightly overlapping letters), that overlap can read as transparent
@@ -210,16 +219,18 @@ fn shadow_object(objects: &[&Value], main_offset: P, shadow_offset: P, side_amt:
     for (sp, is_outer) in objects.iter().flat_map(|o| subpaths_with_role(o)) {
         let back = shift_subpath(&sp, main_offset);
         let sign = signed_area(&back);
-        subpaths.extend(bands_for_out_subpath(&back, shadow_offset).into_iter().map(|b| (wound_like(b, sign), is_outer)));
+        // Bands are always solid (`true`), regardless of `is_outer`: see the doc comment above.
+        subpaths.extend(bands_for_out_subpath(&back, shadow_offset).into_iter().map(|b| (wound_like(b, sign), true)));
         subpaths.push((shift_out_subpath(&back, shadow_offset), is_outer));
         subpaths.push((back, is_outer));
     }
     if subpaths.is_empty() {
         return None;
     }
-    // Every letterform piece (across every letter) shares one winding, so they simply union
-    // together; every counter piece shares the OPPOSITE one, so it keeps subtracting from whatever
-    // letterform material it overlaps (its own letter's, almost always).
+    // Every solid piece (across every letter, letterform or band alike) shares one winding, so
+    // they simply union together; every counter's own flat cross-section shares the OPPOSITE one,
+    // so it keeps subtracting from whatever solid material it overlaps (its own letter's, almost
+    // always).
     let reference = subpaths.iter().find(|(_, is_outer)| *is_outer).map(|(sp, _)| signed_area(sp)).unwrap_or(1.0);
     let subpaths: Vec<OutSubpath> =
         subpaths.into_iter().map(|(sp, is_outer)| wound_like(sp, if is_outer { reference } else { -reference })).collect();
@@ -228,14 +239,57 @@ fn shadow_object(objects: &[&Value], main_offset: P, shadow_offset: P, side_amt:
     Some(OutItem::New(NewObj { kind: "compound", path: OutPathData { subpaths }, fill_rule: "nonzero", fills: [fill] }))
 }
 
-/// `obj`'s subpaths, each tagged with whether it's letterform (`true`, same winding sign as the
-/// largest one by area — e.g. both the dot and the stem of "i", which share no counter) or one of
-/// its counters (`false`, wound the other way — e.g. the hole of "O", "A", "B" or "P").
+/// `obj`'s subpaths, each tagged with whether it's letterform (`true`, e.g. both the dot and the
+/// stem of "i", which share no counter) or one of its counters (`false`, e.g. the hole of "O",
+/// "A", "B" or "P"): the largest one by area is always letterform; every other one is a counter
+/// if it sits GEOMETRICALLY INSIDE it, decided by a point-in-polygon test on its own centroid, not
+/// by comparing winding signs. Winding sign alone isn't reliable here: some glyph sources draw a
+/// hole with the OPPOSITE winding from its outer ring (so plain nonzero fill already shows it as a
+/// hole), but others draw it with the SAME winding and rely on `evenodd` fill instead — sign
+/// comparison would wrongly tag every subpath as letterform for that second kind of data (nothing
+/// would ever be detected as a counter, so nothing would ever stay transparent). Containment is a
+/// geometric fact, true either way.
 fn subpaths_with_role(obj: &Value) -> Vec<(Value, bool)> {
     let Some(subpaths) = obj["path"]["subpaths"].as_array() else { return vec![] };
-    let areas: Vec<f64> = subpaths.iter().map(signed_area_json).collect();
-    let Some(dominant) = areas.iter().max_by(|a, b| a.abs().total_cmp(&b.abs())).map(|a| a.signum()) else { return vec![] };
-    subpaths.iter().zip(&areas).map(|(sp, a)| (sp.clone(), a.signum() == dominant)).collect()
+    let Some(dominant) = subpaths.iter().enumerate().max_by(|(_, a), (_, b)| signed_area_json(a).abs().total_cmp(&signed_area_json(b).abs())) else {
+        return vec![];
+    };
+    let (dominant_i, dominant_anchors) = (dominant.0, dominant.1.get("anchors").and_then(Value::as_array).cloned().unwrap_or_default());
+    subpaths
+        .iter()
+        .enumerate()
+        .map(|(i, sp)| {
+            let is_counter = i != dominant_i
+                && sp.get("anchors").and_then(Value::as_array).is_some_and(|a| point_in_polygon(centroid(a), &dominant_anchors));
+            (sp.clone(), !is_counter)
+        })
+        .collect()
+}
+
+/// The average of `anchors`' own points (ignoring curvature): a representative point known to sit
+/// well inside a typical (roughly convex, as real letterforms' counters are) closed subpath, for
+/// [`point_in_polygon`] to test against another one.
+fn centroid(anchors: &[Value]) -> P {
+    let (sx, sy, n) = anchors.iter().filter_map(|a| point(a, "p")).fold((0.0, 0.0, 0.0_f64), |(sx, sy, n), p| (sx + p.0, sy + p.1, n + 1.0));
+    if n == 0.0 { (0.0, 0.0) } else { (sx / n, sy / n) }
+}
+
+/// Whether `p` lies inside the closed polygon formed by `anchors`' own points (ignoring curvature,
+/// the same approximation [`signed_area_json`] already makes): a standard ray-casting test, used
+/// to tell a counter from a separate letterform piece regardless of which way either one winds.
+fn point_in_polygon(p: P, anchors: &[Value]) -> bool {
+    let n = anchors.len();
+    let mut inside = false;
+    for i in 0..n {
+        let (Some(a), Some(b)) = (point(&anchors[i], "p"), point(&anchors[(i + 1) % n], "p")) else { continue };
+        if (a.1 > p.1) != (b.1 > p.1) {
+            let x_at_p_y = a.0 + (p.1 - a.1) / (b.1 - a.1) * (b.0 - a.0);
+            if p.0 < x_at_p_y {
+                inside = !inside;
+            }
+        }
+    }
+    inside
 }
 
 /// The shoelace signed area of a subpath's anchor `"p"` points, read straight from input JSON.
@@ -750,11 +804,114 @@ mod tests {
         };
         let signs: Vec<f64> = subpaths.iter().map(|sp| area_of(sp).signum()).collect();
         let (positive, negative): (Vec<f64>, Vec<f64>) = signs.iter().copied().partition(|&s| s > 0.0);
+        // The outer's own 6 pieces, plus the counter's own 4 bands (its tube wall is solid,
+        // exactly like the outer's own side bands), share one winding; only the counter's 2 flat
+        // cross-sections (its shape here, and its shadow-shifted copy) oppose it and stay a hole.
         assert_eq!(
             (positive.len(), negative.len()),
-            (6, 6),
-            "the outer's 6 pieces and the counter's 6 must wind oppositely so the counter stays a hole: {signs:?}"
+            (10, 2),
+            "only the counter's 2 flat cross-sections stay a hole, not its connecting bands: {signs:?}"
         );
+    }
+
+    /// A SECOND regression this fixes: some glyph sources draw a counter with the SAME winding as
+    /// its outer ring (relying on `evenodd` fill, not on opposite winding under `nonzero`) — the
+    /// hole must still be detected and stay transparent, not disappear entirely. Detecting a
+    /// counter by comparing winding signs (the previous approach) tags NOTHING as a counter for
+    /// this kind of data (both subpaths share the same sign), so the whole shadow used to render
+    /// fully solid grey with no hole at all, even though the hole's own shape was still present in
+    /// the output.
+    #[test]
+    fn a_same_winding_counter_still_stays_transparent() {
+        let outer = json!({"closed": true, "anchors": [{"p": [0.0, 0.0]}, {"p": [20.0, 0.0]}, {"p": [20.0, 20.0]}, {"p": [0.0, 20.0]}]});
+        // Wound the SAME way as `outer` (both TL,TR,BR,BL) — only valid as a hole under `evenodd`.
+        let hole = json!({"closed": true, "anchors": [{"p": [5.0, 5.0]}, {"p": [15.0, 5.0]}, {"p": [15.0, 15.0]}, {"p": [5.0, 15.0]}]});
+        let obj = json!({"id": 1, "type": "path", "fillRule": "evenodd",
+            "path": {"subpaths": [outer, hole]}});
+        let out =
+            run_json(&json!({"objects": [obj]}), &json!({"angle": 90, "distance": 10, "shadow": true, "shadowAngle": 135, "shadowDistance": 5}));
+        let subpaths = out["objects"][0]["path"]["subpaths"].as_array().unwrap();
+        assert_eq!(subpaths.len(), 12, "the counter must still cast its own shadow pieces: {subpaths:?}");
+        let area_of = |sp: &Value| -> f64 {
+            let anchors = sp["anchors"].as_array().unwrap();
+            let n = anchors.len();
+            (0..n)
+                .map(|i| {
+                    let (a, b) = (point(&anchors[i], "p").unwrap(), point(&anchors[(i + 1) % n], "p").unwrap());
+                    a.0 * b.1 - b.0 * a.1
+                })
+                .sum()
+        };
+        let signs: Vec<f64> = subpaths.iter().map(|sp| area_of(sp).signum()).collect();
+        let (positive, negative): (Vec<f64>, Vec<f64>) = signs.iter().copied().partition(|&s| s > 0.0);
+        assert_eq!(
+            (positive.len(), negative.len()),
+            (10, 2),
+            "the same-winding counter must still be detected (geometric containment, not sign comparison) and stay a hole: {signs:?}"
+        );
+    }
+
+    /// The specific regression this fixes: a counter's own connecting bands (the wall of its own
+    /// little tube, from its shape here to its shadow-shifted copy) must be solid, not holes —
+    /// tagging them as holes (same as its two flat cross-sections) used to create a transparent
+    /// "tunnel" connecting the two cross-sections, looking like a hollow cylinder cut clean
+    /// through the grey shadow.
+    #[test]
+    fn a_counters_connecting_bands_are_solid_not_a_see_through_tunnel() {
+        let outer = json!({"closed": true, "anchors": [{"p": [0.0, 0.0]}, {"p": [20.0, 0.0]}, {"p": [20.0, 20.0]}, {"p": [0.0, 20.0]}]});
+        let hole = json!({"closed": true, "anchors": [{"p": [5.0, 5.0]}, {"p": [5.0, 15.0]}, {"p": [15.0, 15.0]}, {"p": [15.0, 5.0]}]});
+        let obj = json!({"id": 1, "type": "path", "fillRule": "nonzero",
+            "path": {"subpaths": [outer, hole]}});
+        let (angle, distance, shadow_angle, shadow_distance) = (90.0, 10.0, 135.0, 5.0);
+        let out = run_json(
+            &json!({"objects": [obj]}),
+            &json!({"angle": angle, "distance": distance, "shadow": true, "shadowAngle": shadow_angle, "shadowDistance": shadow_distance}),
+        );
+        let subpaths = out["objects"][0]["path"]["subpaths"].as_array().unwrap();
+        let area_of = |sp: &Value| -> f64 {
+            let anchors = sp["anchors"].as_array().unwrap();
+            let n = anchors.len();
+            (0..n)
+                .map(|i| {
+                    let (a, b) = (point(&anchors[i], "p").unwrap(), point(&anchors[(i + 1) % n], "p").unwrap());
+                    a.0 * b.1 - b.0 * a.1
+                })
+                .sum()
+        };
+        // The counter's own two flat cross-sections, computed directly the same way the plug-in
+        // itself builds them: its shape at the back face, and that shifted again towards the
+        // shadow.
+        let main_offset = compass_offset(angle, distance);
+        let shadow_offset = compass_offset(shadow_angle, shadow_distance);
+        let shift = |p: (f64, f64), o: (f64, f64)| (p.0 + o.0, p.1 + o.1);
+        let hole_pts: Vec<(f64, f64)> = hole["anchors"].as_array().unwrap().iter().map(|a| point(a, "p").unwrap()).collect();
+        let cap1: Vec<(f64, f64)> = hole_pts.iter().map(|&p| shift(p, main_offset)).collect();
+        let cap2: Vec<(f64, f64)> = cap1.iter().map(|&p| shift(p, shadow_offset)).collect();
+        let matches_cap = |sp: &Value, cap: &[(f64, f64)]| {
+            let anchors = sp["anchors"].as_array().unwrap();
+            anchors.len() == cap.len()
+                && anchors.iter().all(|a| {
+                    let p = point(a, "p").unwrap();
+                    cap.iter().any(|c| (c.0 - p.0).abs() < 1e-6 && (c.1 - p.1).abs() < 1e-6)
+                })
+        };
+        let cap1_sp =
+            subpaths.iter().find(|sp| matches_cap(sp, &cap1)).unwrap_or_else(|| panic!("the counter's own back face not found: {subpaths:?}"));
+        let cap2_sp = subpaths
+            .iter()
+            .find(|sp| matches_cap(sp, &cap2))
+            .unwrap_or_else(|| panic!("the counter's shadow-shifted copy not found: {subpaths:?}"));
+        assert!((area_of(cap1_sp) * area_of(cap2_sp)) > 0.0, "both the counter's cross-sections wind the same way");
+        // Every OTHER subpath (the outer's own 6 pieces, and the counter's own 4 connecting
+        // bands) must wind the OPPOSITE way: the connecting bands are solid, matching the outer,
+        // not holes matching their own counter's cross-sections.
+        let cap_sign = area_of(cap1_sp).signum();
+        for sp in subpaths {
+            if std::ptr::eq(sp, cap1_sp) || std::ptr::eq(sp, cap2_sp) {
+                continue;
+            }
+            assert_ne!(area_of(sp).signum(), cap_sign, "every piece other than the counter's own cross-sections must be solid: {sp}");
+        }
     }
 
     /// Two overlapping letters (no counters here): their outer silhouettes must union seamlessly
@@ -819,7 +976,9 @@ mod tests {
         };
         let signs: Vec<f64> = subpaths.iter().map(|sp| area_of(sp).signum()).collect();
         let (positive, negative): (Vec<f64>, Vec<f64>) = signs.iter().copied().partition(|&s| s > 0.0);
-        assert_eq!((positive.len(), negative.len()), (12, 12), "both letters' outers agree, both counters agree, and oppose: {signs:?}");
+        // 10 solid pieces per letter (6 outer + the counter's own 4 connecting bands), 2 hole
+        // pieces per letter (only the counter's own flat cross-sections): 20/4 for both letters.
+        assert_eq!((positive.len(), negative.len()), (20, 4), "both letters' solid pieces agree, both counters' cross-sections agree, and oppose: {signs:?}");
     }
 
     /// Every subpath the shadow merges winds the same way. A band wound the other way from the
@@ -957,6 +1116,84 @@ mod tests {
         // the other 2 edges keep their single band: 6 bands per circle, 12 for the 2 (outer +
         // hole) subpaths of "O", plus its one merged back face and the kept front.
         assert_eq!(out["objects"].as_array().unwrap().len(), 12 + 2, "{out}");
+    }
+
+    /// A true, properly-wound "O" (unlike [`letter_o`], whose two circles happen to share the same
+    /// winding and so never actually behave like a real nonzero counter — fine for the budget
+    /// tests above, which only count objects, but not a valid hole): the outer ring CW, the inner
+    /// hole CCW, both curved on every edge. The shadow must still treat the hole's own connecting
+    /// bands as solid and only its two flat cross-sections as the actual hole, exactly as for a
+    /// straight-edged counter.
+    #[test]
+    fn a_curved_counters_connecting_bands_are_solid_not_a_see_through_tunnel() {
+        fn circle(cx: f64, cy: f64, r: f64, clockwise: bool) -> Value {
+            let k = 0.5522847498;
+            let pts = [
+                (cx, cy - r, cx - k * r, cy - r, cx + k * r, cy - r),
+                (cx + r, cy, cx + r, cy - k * r, cx + r, cy + k * r),
+                (cx, cy + r, cx + k * r, cy + r, cx - k * r, cy + r),
+                (cx - r, cy, cx - r, cy + k * r, cx - r, cy - k * r),
+            ];
+            let mut anchors: Vec<Value> =
+                pts.iter().map(|&(px, py, ix, iy, ox, oy)| json!({"p": [px, py], "in": [ix, iy], "out": [ox, oy]})).collect();
+            if !clockwise {
+                anchors.reverse();
+                for a in &mut anchors {
+                    let (p_in, p_out) = (a["in"].clone(), a["out"].clone());
+                    a["in"] = p_out;
+                    a["out"] = p_in;
+                }
+            }
+            json!({"closed": true, "anchors": anchors})
+        }
+        let obj = json!({"id": 1, "type": "compound", "fillRule": "nonzero",
+            "path": {"subpaths": [circle(100.0, 100.0, 80.0, true), circle(100.0, 100.0, 40.0, false)]}});
+        let (angle, distance, shadow_angle, shadow_distance) = (90.0, 10.0, 135.0, 5.0);
+        let out = run_json(
+            &json!({"objects": [obj]}),
+            &json!({"angle": angle, "distance": distance, "shadow": true, "shadowAngle": shadow_angle, "shadowDistance": shadow_distance}),
+        );
+        let subpaths = out["objects"][0]["path"]["subpaths"].as_array().unwrap();
+        let area_of = |sp: &Value| -> f64 {
+            let anchors = sp["anchors"].as_array().unwrap();
+            let n = anchors.len();
+            (0..n)
+                .map(|i| {
+                    let (a, b) = (point(&anchors[i], "p").unwrap(), point(&anchors[(i + 1) % n], "p").unwrap());
+                    a.0 * b.1 - b.0 * a.1
+                })
+                .sum()
+        };
+        // The inner circle's own two flat cross-sections, computed directly the same way the
+        // plug-in itself builds them: its shape at the back face, and that shifted again towards
+        // the shadow.
+        let hole = circle(100.0, 100.0, 40.0, false);
+        let main_offset = compass_offset(angle, distance);
+        let shadow_offset = compass_offset(shadow_angle, shadow_distance);
+        let shift = |p: (f64, f64), o: (f64, f64)| (p.0 + o.0, p.1 + o.1);
+        let hole_pts: Vec<(f64, f64)> = hole["anchors"].as_array().unwrap().iter().map(|a| point(a, "p").unwrap()).collect();
+        let cap1: Vec<(f64, f64)> = hole_pts.iter().map(|&p| shift(p, main_offset)).collect();
+        let cap2: Vec<(f64, f64)> = cap1.iter().map(|&p| shift(p, shadow_offset)).collect();
+        let matches_cap = |sp: &Value, cap: &[(f64, f64)]| {
+            let anchors = sp["anchors"].as_array().unwrap();
+            anchors.len() == cap.len()
+                && anchors.iter().all(|a| {
+                    let p = point(a, "p").unwrap();
+                    cap.iter().any(|c| (c.0 - p.0).abs() < 1e-6 && (c.1 - p.1).abs() < 1e-6)
+                })
+        };
+        let cap1_sp =
+            subpaths.iter().find(|sp| matches_cap(sp, &cap1)).unwrap_or_else(|| panic!("the hole's own back face not found: {subpaths:?}"));
+        let cap2_sp =
+            subpaths.iter().find(|sp| matches_cap(sp, &cap2)).unwrap_or_else(|| panic!("the hole's shadow-shifted copy not found: {subpaths:?}"));
+        assert!((area_of(cap1_sp) * area_of(cap2_sp)) > 0.0, "both the hole's cross-sections wind the same way");
+        let cap_sign = area_of(cap1_sp).signum();
+        for sp in subpaths {
+            if std::ptr::eq(sp, cap1_sp) || std::ptr::eq(sp, cap2_sp) {
+                continue;
+            }
+            assert_ne!(area_of(sp).signum(), cap_sign, "every piece other than the hole's own cross-sections must be solid: {sp}");
+        }
     }
 
     /// A full sentence's worth of round, holed letters (the worst realistic case: 8 curved edges
