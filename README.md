@@ -7,7 +7,7 @@ extrudes lettering and custom shapes the way sign painters and lettering artists
 it by hand: duplicate the letterform, offset the copy, and connect the two with clean side faces —
 no 3D distortion, no warped letterforms. Made by [Club Lettreurs](https://www.clublettreurs.com).
 
-<p align="center"><img src="images/04.png" alt="Extruded ABC lettering with a cast shadow, built entirely from separate, selectable faces" width="640"></p>
+<p align="center"><img src="images/04-v0.3.0.png" alt="Extruded ABC lettering with a cast shadow, built entirely from separate, selectable faces" width="640"></p>
 
 ---
 
@@ -33,7 +33,7 @@ the side faces are split in two tones — a cavalier-perspective touch that read
 consistently-lit solid instead of one flat slab of colour.
 
 <p align="center">
-  <img src="images/plugin.png" alt="The plug-in's parameter dialog" width="200">
+  <img src="images/plugin-v0.3.0.png" alt="The plug-in's parameter dialog" width="200">
   <img src="images/01.png" alt="The original selected letterforms" width="200">
   <img src="images/02.png" alt="The letterforms extruded" width="200">
   <img src="images/03.png" alt="The extruded letterforms with a cast shadow" width="200">
@@ -143,7 +143,7 @@ dessinée. À un angle diagonal, les faces latérales se séparent en deux tons 
 perspective cavalière qui donne un solide crédible et cohérent plutôt qu'un seul aplat de couleur.
 
 <p align="center">
-  <img src="images/plugin.png" alt="Le dialogue de paramètres du plugin" width="200">
+  <img src="images/plugin-v0.3.0.png" alt="Le dialogue de paramètres du plugin" width="200">
   <img src="images/01.png" alt="Les lettres sélectionnées, avant extrusion" width="200">
   <img src="images/02.png" alt="Les lettres extrudées" width="200">
   <img src="images/03.png" alt="Les lettres extrudées avec une ombre portée" width="200">
