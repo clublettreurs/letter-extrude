@@ -51,6 +51,10 @@ consistently-lit solid instead of one flat slab of colour.
   no shadow, on the bottom, unless the extrusion points upward, in which case the side face darkens
   instead. At an exact cardinal angle (0°/90°/180°/270°) there is only one face, so this has no
   effect. Default **30%**.
+  - With a cast shadow, the two tones follow it: on a curved letter ("O", "C", "S"...) the tone
+    changes exactly where the shadow's outline touches the face, and at an inside corner (where a
+    "T"'s bar meets its stem, for example) the bar casts a shade line across the lit face next to
+    it, from the corner on the front face to the back face, darkening the part in its shade.
 - **Shadow** — an optional cast shadow: the back face is extruded a second time, towards its own
   angle and distance, and everything (every letter's back face, its own extrusion and the
   connecting bands) is merged into one single shape placed behind everything else. Several
@@ -163,6 +167,11 @@ perspective cavalière qui donne un solide crédible et cohérent plutôt qu'un 
   le haut, auquel cas c'est la face latérale qui s'assombrit à la place. À un angle cardinal exact
   (0°/90°/180°/270°), il n'y a qu'une seule face, donc ce paramètre n'a aucun effet. Par défaut
   **30 %**.
+  - Avec une ombre portée, les deux tons la suivent : sur une lettre courbe (« O », « C », « S »...)
+    le ton change exactement là où le contour de l'ombre touche la face, et dans un angle intérieur
+    (là où la barre d'un « T » rejoint son fût, par exemple) la barre projette une ligne d'ombre
+    sur la face éclairée voisine, de l'angle sur la face avant jusqu'à la face arrière, et assombrit
+    la partie qui se trouve dans son ombre.
 - **Shadow** (ombre portée) — une ombre portée facultative : la face arrière est elle-même extrudée
   une seconde fois, selon son propre angle et sa propre distance, et le tout (face arrière, sa
   propre extrusion et les bandes de liaison, pour chaque lettre) est fusionné en une seule forme
